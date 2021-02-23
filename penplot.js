@@ -183,7 +183,83 @@ function pathsToSVG (inputs, opt) {
   ].join('\n');
 }
 
-function toAttrList (args) {
+module.exports.pathsToGCode = pathsToGCode;
+function pathsToGCode(inputs, opt) {
+  opt = opt || {};
+
+  var viewUnits = 'px';
+  var units = opt.units || viewUnits;
+
+  var convertOptions = {
+    units: units,
+    viewUnits: 'px',
+    roundPixel: false,
+    precision: defined(opt.precision, 5),
+    pixelsPerInch: DEFAULT_PIXELS_PER_INCH
+  };
+
+  // Convert all SVGPaths/paths/etc to polylines
+  // This won't change their units so they are still in user space
+  inputs = pathsToPolylines(inputs, Object.assign({}, convertOptions, {
+    curveResolution: opt.curveResolution || undefined
+  }));
+
+  // TODO: allow for 'repeat' option
+  if (opt.optimize) {
+    var optimizeOpts = typeof opt.optimize === 'object' ? opt.optimize : {
+      sort: true,
+      merge: true,
+      removeDuplicates: true,
+      removeCollinear: true
+    };
+    var shouldSort = optimizeOpts.sort !== false;
+    var shouldMerge = optimizeOpts.merge !== false;
+    var shouldRemoveDuplicate = optimizeOpts.removeDuplicates !== false;
+    var shouldRemoveCollinear = optimizeOpts.removeCollinear !== false;
+    if (shouldRemoveDuplicate) {
+      inputs = inputs.map(function (line) {
+        return geometry.removeDuplicatePoints(line);
+      });
+    }
+    if (shouldRemoveCollinear) {
+      inputs = inputs.map(function (line) {
+        return geometry.removeCollinearPoints(line);
+      });
+    }
+    // now do sorting & merging
+    if (shouldSort) inputs = optimizer.sort(inputs);
+    if (shouldMerge) {
+      var mergeThreshold = optimizeOpts.mergeThreshold != null
+        ? optimizeOpts.mergeThreshold
+        : convert(0.25, 'mm', units, {
+          pixelsPerInch: DEFAULT_PIXELS_PER_INCH
+        });
+      inputs = optimizer.merge(inputs, mergeThreshold);
+    }
+  }
+
+  // now we convert all polylines in user space units into view units
+  var gcode = convertToGCode(inputs, opt);
+  var gcodes = Array.isArray(gcode) ? gcode : [gcode];
+  gcodes.filter(Boolean);
+
+  var pathElements = gcodes.map(function (d) {
+    return d + '\nS0 M5';
+  }).join('\n');
+
+  return [
+    'A1 ; servo mode',
+    'G21 ; units = mm',
+    'G90 ; absolute distance mode',
+    'F1000 ; feed rate',
+    'S0 M5 ; pen up',
+    'G0 X0 Y0 ; home',
+    pathElements,
+    'G0 X0 Y0'
+  ].join('\n');
+}
+
+function toAttrList(args) {
   return args.filter(Boolean).map(function (attr) {
     return attr[0] + '="' + attr[1] + '"';
   }).join(' ');
@@ -218,7 +294,7 @@ function renderPaths (inputs, opt) {
   context.clearRect(0, 0, width, height);
 
   // Fill with white
-  context.fillStyle = opt.background || 'white';
+  context.fillStyle = opt.background || opt.fillStyle || 'white';
   context.fillRect(0, 0, width, height);
 
   context.strokeStyle = opt.foreground || opt.strokeStyle || 'black';
@@ -245,12 +321,15 @@ function renderPaths (inputs, opt) {
 
   // Save layers
   return [
-    // Export PNG as first layer
-    context.canvas,
-    // Export SVG for pen plotter as second layer
+    // Export SVG for pen plotter
     {
       data: pathsToSVG(inputs, opt),
       extension: '.svg'
+    },
+    // Export to gcode as well
+    {
+      data: pathsToGCode(inputs, opt),
+      extension: '.gcode'
     }
   ];
 }
@@ -280,6 +359,32 @@ function convertToSVGPath (input, opt) {
   if (Array.isArray(input)) {
     return input.map(function (feature) {
       return convertToSVGPath(feature, opt);
+    }).reduce(function (a, b) {
+      return a.concat(b);
+    }, []);
+  }
+
+  // Wasn't clear... let's return an empty path
+  return '';
+}
+
+module.exports.convertToGCode = convertToGCode;
+function convertToGCode(input, opt) {
+  // Input can be a single polyline or an array of polylines
+
+  if (isEmpty(input) || isPath(input)) return '';
+
+  // strings are just returned as-is
+  if (typeof input === 'string') return input;
+
+  if (isPolyline(input)) {
+    return polylineToGCode(input, opt);
+  }
+
+  // assume a list of polylines
+  if (Array.isArray(input)) {
+    return input.map(function (feature) {
+      return convertToGCode(feature, opt);
     }).reduce(function (a, b) {
       return a.concat(b);
     }, []);
@@ -340,7 +445,31 @@ function polylineToSVGPath (polyline, opt) {
   return commands.join(' ');
 }
 
-function isEmpty (input) {
+module.exports.polylineToGCode = polylineToGCode;
+function polylineToGCode(polyline, opt) {
+  opt = opt || {};
+  var units = opt.units || 'px';
+  var commands = [];
+  var convertOptions = {
+    roundPixel: false,
+    precision: defined(opt.precision, 5),
+    pixelsPerInch: DEFAULT_PIXELS_PER_INCH
+  };
+  polyline.forEach(function (point, j) {
+    var x = convert(point[0], units, 'mm', convertOptions).toString();
+    var y = convert(point[1], units, 'mm', convertOptions).toString();
+    if (j === 0) {
+      commands.push('G0 X' + x + ' Y' + y);
+      commands.push('S1000 M3')
+    }
+    else {
+      commands.push('G1 X' + x + ' Y' + y);
+    }
+  });
+  return commands.join('\n');
+}
+
+function isEmpty(input) {
   return !input || (Array.isArray(input) && input.length === 0);
 }
 
